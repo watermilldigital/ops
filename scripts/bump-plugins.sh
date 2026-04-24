@@ -61,9 +61,6 @@ fi
 # → "wordfence"). Emitted as newline-delimited "slug<TAB>package" pairs.
 SLUG_MAP=$(jq -r '.require | to_entries[] | "\(.key | split("/")[-1])\t\(.key)"' composer.json)
 
-declare -a REPORT_ENTRIES=()
-declare -a UPDATED_PACKAGES=()
-
 # Sort and dedupe vulns by slug so we don't try to update the same package
 # twice in one run (a plugin may have multiple open CVEs).
 VULNS_BY_SLUG=$(jq -c '
@@ -197,8 +194,6 @@ while IFS= read -r vuln; do
     snapshot_save
     try_bump_package "$package" "$fixed" "$vuln" || true
   done
-
-  UPDATED_PACKAGES+=("${matches[@]}")
 done <<< "$VULNS_BY_SLUG"
 
 jq -n \

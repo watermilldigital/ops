@@ -56,14 +56,22 @@ fi
 AUTH=(-H "Authorization: Bearer ${ACCESS_TOKEN}" -H "Accept: application/json")
 
 trigger_refresh() {
-  curl -sS --fail-with-body "${AUTH[@]}" \
-    "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}/refresh?server_id=${CW_SERVER_ID}" \
-    > /dev/null || echo "Refresh request failed (continuing)" >&2
+  local body
+  if ! body=$(curl -sS --fail-with-body "${AUTH[@]}" \
+      "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}/refresh?server_id=${CW_SERVER_ID}" \
+      2>&1); then
+    echo "Refresh request failed (continuing, but scan freshness may suffer):" >&2
+    echo "$body" >&2
+  fi
 }
 
 fetch_once() {
+  # `--fail-with-body` turns non-2xx into a failure; `|| true` keeps the
+  # script alive under `set -e` so the caller can inspect the body via
+  # response_ok() rather than aborting.
   curl -sS --fail-with-body "${AUTH[@]}" \
-    "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}?server_id=${CW_SERVER_ID}"
+    "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}?server_id=${CW_SERVER_ID}" \
+    2>/dev/null || true
 }
 
 response_ok() {
@@ -82,9 +90,14 @@ fi
 RAW=$(fetch_once)
 
 if ! response_ok "$RAW"; then
-  msg=$(echo "$RAW" | jq -r '.message // ""' 2>/dev/null)
-  if [[ "$msg" == *"not available"* ]]; then
-    echo "No scan data yet for this app. Triggering refresh and polling..." >&2
+  # Detect "scan not ready" cases broadly — Cloudways has used several
+  # wordings ("not available", "No scan data"). We poll on ANY non-success
+  # status: false response and let the scan either succeed or time out
+  # cleanly rather than depend on exact substring matching.
+  status=$(echo "$RAW" | jq -r '.status // "unknown"' 2>/dev/null)
+  if [ "$status" = "false" ]; then
+    echo "Cloudways reports no usable scan data yet. Triggering refresh and polling..." >&2
+    echo "$RAW" | jq -r '"  Cloudways message: \(.message // "(none)")"' >&2 2>/dev/null || true
     trigger_refresh
     # Poll: 10 attempts, 30s apart = 5-minute budget
     for i in $(seq 1 10); do

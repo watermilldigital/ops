@@ -40,22 +40,32 @@ BRANCH="security/weekly-$(date -u +%Y-%m-%d)"
 # `security/weekly-notes` or similar isn't accidentally nuked. Don't pass
 # --delete-branch either — let the repo's branch-delete-on-merge setting
 # (or manual cleanup) handle branch removal.
-STRAGGLER_PRS=$(gh pr list --state open --search "head:security/weekly-" \
-  --json number,headRefName \
-  --jq '.[] | select(.headRefName != "'"$BRANCH"'"
-                     and (.headRefName | test("^security/weekly-[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
-              | .number' \
-  2>/dev/null || true)
-for pr in $STRAGGLER_PRS; do
-  echo "Closing stale security PR #$pr (superseded by current run)"
-  gh pr close "$pr" --comment "Superseded by this week's vulnerability check run. Reopen if you still want to land these specific changes." || true
-done
+if stragglers_raw=$(gh pr list --state open --search "head:security/weekly-" \
+      --json number,headRefName 2>&1); then
+  STRAGGLER_PRS=$(echo "$stragglers_raw" | jq -r \
+    '.[] | select(.headRefName != "'"$BRANCH"'"
+                  and (.headRefName | test("^security/weekly-[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+     | .number')
+  for pr in $STRAGGLER_PRS; do
+    echo "Closing stale security PR #$pr (superseded by current run)"
+    gh pr close "$pr" --comment "Superseded by this week's vulnerability check run. Reopen if you still want to land these specific changes." || true
+  done
+else
+  echo "WARNING: could not list existing security PRs — stale-PR cleanup skipped for this run:" >&2
+  echo "  $stragglers_raw" >&2
+fi
 
 # If today's branch already exists on the remote (e.g. two runs on the same
-# day), fetch and reset to it so we update rather than conflict.
+# day), fetch and check it out. Fail loud rather than silently creating a
+# fresh branch from HEAD — that would clobber any commits on the remote
+# branch (human manual commit, previous-run commit we haven't seen yet, etc.)
+# via the subsequent --force-with-lease push.
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH" 2>/dev/null || true
-  git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
+  if ! git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH" 2>&1; then
+    echo "ERROR: remote branch $BRANCH exists but fetch failed — aborting to avoid clobbering it" >&2
+    exit 1
+  fi
+  git checkout -B "$BRANCH" "origin/$BRANCH"
 else
   git checkout -B "$BRANCH"
 fi
