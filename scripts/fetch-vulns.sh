@@ -55,25 +55,54 @@ fi
 
 AUTH=(-H "Authorization: Bearer ${ACCESS_TOKEN}" -H "Accept: application/json")
 
-# 2. Optionally trigger a fresh Patchstack scan. The refresh endpoint returns
-#    an operation_id immediately; we don't poll because the subsequent list
-#    call will return whatever data is currently cached.
-if [ "${CW_REFRESH:-0}" = "1" ]; then
+trigger_refresh() {
   curl -sS --fail-with-body "${AUTH[@]}" \
     "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}/refresh?server_id=${CW_SERVER_ID}" \
-    > /dev/null || echo "Refresh request failed (continuing with cached data)" >&2
+    > /dev/null || echo "Refresh request failed (continuing)" >&2
+}
+
+fetch_once() {
+  curl -sS --fail-with-body "${AUTH[@]}" \
+    "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}?server_id=${CW_SERVER_ID}"
+}
+
+response_ok() {
+  echo "$1" | jq -e '.status == true and (.data | type) == "object"' >/dev/null
+}
+
+# 2. Optionally trigger a fresh Patchstack scan up-front (workflow input).
+if [ "${CW_REFRESH:-0}" = "1" ]; then
+  echo "Triggering Cloudways/Patchstack refresh (CW_REFRESH=1)..." >&2
+  trigger_refresh
 fi
 
-# 3. Fetch the vulnerability list.
-RAW=$(curl -sS --fail-with-body "${AUTH[@]}" \
-  "${CW_API_BASE}/app/vulnerabilities/${CW_APP_ID}?server_id=${CW_SERVER_ID}")
+# 3. Fetch the vulnerability list. If Cloudways says data isn't available yet
+#    (first-run on an app that's never been scanned), auto-trigger refresh and
+#    poll for up to ~5 minutes — Patchstack scans typically finish quickly.
+RAW=$(fetch_once)
 
-# 3a. Guard against Cloudways returning HTTP 200 with {"status": false, ...}.
-#     Without this, malformed responses silently normalise to [] and the
-#     workflow looks green despite never actually checking vulnerabilities.
-if ! echo "$RAW" | jq -e '.status == true and (.data | type) == "object"' >/dev/null; then
-  echo "Cloudways API returned a non-success response:" >&2
+if ! response_ok "$RAW"; then
+  msg=$(echo "$RAW" | jq -r '.message // ""' 2>/dev/null)
+  if [[ "$msg" == *"not available"* ]]; then
+    echo "No scan data yet for this app. Triggering refresh and polling..." >&2
+    trigger_refresh
+    # Poll: 10 attempts, 30s apart = 5-minute budget
+    for i in $(seq 1 10); do
+      sleep 30
+      echo "  poll attempt $i/10..." >&2
+      RAW=$(fetch_once)
+      response_ok "$RAW" && break
+    done
+  fi
+fi
+
+if ! response_ok "$RAW"; then
+  echo "Cloudways API returned a non-success response after polling:" >&2
   echo "$RAW" | jq . >&2 2>/dev/null || echo "$RAW" >&2
+  echo "" >&2
+  echo "If this is the first run on this app, try again in ~10 minutes —" >&2
+  echo "Patchstack may still be doing its initial scan. The scheduled weekly" >&2
+  echo "run will retry automatically." >&2
   exit 1
 fi
 
