@@ -56,6 +56,12 @@ if [ "$MANUAL_COUNT" = "0" ]; then
   exit 0
 fi
 
+# Ensure the `security` label exists in the caller repo before tagging the
+# issue with it (gh issue create fails hard if the label is missing).
+gh label create "$ISSUE_LABEL" \
+  --description "Security update (Cloudways/Patchstack vulnerability scan)" \
+  --color "d73a4a" 2>/dev/null || true
+
 ISSUE_BODY=$(echo "$MANUAL_SKIPS" | jq -r '
   def category:
     if .type == "core" then "wp-core"
