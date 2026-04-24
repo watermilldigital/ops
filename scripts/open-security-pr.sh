@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Opens a single rollup PR for the week's plugin security updates.
+#
+# Preconditions:
+#   - bump-plugins.sh has already run and left composer.json / composer.lock
+#     modified (or unchanged, in which case this script exits cleanly)
+#   - .github/vuln-report.json exists with the summary of what was updated
+#   - gh CLI is authenticated (via $GITHUB_TOKEN in GH Actions)
+#   - git user.name / user.email are configured
+
+set -euo pipefail
+
+REPORT=".github/vuln-report.json"
+BASE_BRANCH="${BASE_BRANCH:-main}"
+
+if [ ! -f "$REPORT" ]; then
+  echo "$REPORT not found — did bump-plugins.sh run?" >&2
+  exit 1
+fi
+
+UPDATE_COUNT=$(jq '.updates | length' "$REPORT")
+
+if [ "$UPDATE_COUNT" = "0" ]; then
+  echo "No plugin updates applied — nothing to PR."
+  exit 0
+fi
+
+if git diff --quiet composer.json composer.lock; then
+  echo "composer.json / composer.lock unchanged despite $UPDATE_COUNT update(s) — nothing to commit."
+  exit 0
+fi
+
+BRANCH="security/weekly-$(date -u +%Y-%m-%d)"
+
+# Close any stragglers: open PRs on previous `security/weekly-YYYY-MM-DD`
+# branches that aren't today's. They're outdated by design — this run
+# supersedes them with whatever Patchstack currently reports.
+#
+# Match ONLY the strict date-suffixed branch pattern so a human-created
+# `security/weekly-notes` or similar isn't accidentally nuked. Don't pass
+# --delete-branch either — let the repo's branch-delete-on-merge setting
+# (or manual cleanup) handle branch removal.
+STRAGGLER_PRS=$(gh pr list --state open --search "head:security/weekly-" \
+  --json number,headRefName \
+  --jq '.[] | select(.headRefName != "'"$BRANCH"'"
+                     and (.headRefName | test("^security/weekly-[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+              | .number' \
+  2>/dev/null || true)
+for pr in $STRAGGLER_PRS; do
+  echo "Closing stale security PR #$pr (superseded by current run)"
+  gh pr close "$pr" --comment "Superseded by this week's vulnerability check run. Reopen if you still want to land these specific changes." || true
+done
+
+# If today's branch already exists on the remote (e.g. two runs on the same
+# day), fetch and reset to it so we update rather than conflict.
+if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH" 2>/dev/null || true
+  git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
+else
+  git checkout -B "$BRANCH"
+fi
+
+# After the branch switch, re-evaluate whether there's anything new to commit.
+# A previous run on this same branch may already have the exact fixes we just
+# applied — in which case the working tree matches HEAD and `git commit` would
+# fail. We still want to refresh the PR body, so skip the commit but continue.
+if git diff --quiet HEAD -- composer.json composer.lock; then
+  echo "Branch $BRANCH already has these fixes committed — skipping commit, refreshing PR metadata only."
+else
+  git add composer.json composer.lock
+
+  # Commit body: one line per updated package.
+  COMMIT_SUMMARY=$(jq -r '
+    .updates | map("\(.package): \(.version_before) → \(.version_after)")
+    | join("\n- ") | "- " + .
+  ' "$REPORT")
+
+  git commit -m "ops(security): weekly plugin vulnerability updates
+
+$COMMIT_SUMMARY"
+
+  git push -u origin "$BRANCH" --force-with-lease
+fi
+
+# Compose PR body. Layout: short scannable table up top, expanded card per
+# vuln below with the full Patchstack details. Tables don't handle long CVE
+# titles well, so we deliberately keep them out of the summary row.
+PR_BODY=$(jq -r '
+  def sev_emoji:
+    {critical:"🔴", high:"🟠", medium:"🟡", low:"🟢"}[. // ""] // "⚪";
+
+  def severity_label($u):
+    ($u.max_severity // "n/a") as $s |
+    ($s | sev_emoji) + " " + $s
+    + (if $u.max_cvss then " · CVSS \($u.max_cvss)" else "" end);
+
+  def card($u):
+    "### \((.max_severity // "n/a") | sev_emoji) `\($u.package)` · `\($u.version_before)` → `\($u.version_after)`\n\n"
+    + (if $u.vuln_types and ($u.vuln_types | length > 0)
+       then "**\($u.vuln_types | join(", "))**"
+       else "" end)
+    + (if $u.max_cvss then " · CVSS \($u.max_cvss) (\($u.max_severity // "n/a"))" else "" end)
+    + "\n\n"
+    + (($u.titles // []) | map("> " + .) | join("\n>\n"))
+    + "\n\n"
+    + (($u.patchstack_urls // []) | map("<" + . + ">") | join("\n"))
+    + "\n";
+
+  "## Patchstack-reported vulnerabilities resolved\n\n"
+  + "| Package | Update | Severity |\n"
+  + "|---------|--------|----------|\n"
+  + (.updates | map(
+      "| `\(.package)` | `\(.version_before)` → `\(.version_after)` | \(severity_label(.)) |"
+    ) | join("\n"))
+  + "\n\n---\n\n"
+  + (.updates | map(card(.)) | join("\n---\n\n"))
+  + (if (.skipped | length) > 0 then
+      "\n\n## Skipped\n\n"
+      + (.skipped | map("- `\(.slug)` (\(.type // "plugin")): \(.reason)") | join("\n"))
+     else "" end)
+  + "\n\n---\n\nSource: Cloudways Vulnerability Scanner (Patchstack). "
+  + "Generated by `.github/workflows/vulnerability-check.yml`.\n"
+' "$REPORT")
+
+PR_TITLE="ops(security): weekly plugin updates ($(date -u +%Y-%m-%d))"
+
+# Ensure the `security` label exists before attaching it (gh pr create fails
+# hard if the label is missing). Idempotent — `|| true` swallows the "already
+# exists" error on subsequent runs.
+gh label create security \
+  --description "Security update (Cloudways/Patchstack vulnerability scan)" \
+  --color "d73a4a" 2>/dev/null || true
+
+# Who to assign. Expected to be set by the reusable workflow from
+# inputs.assignee (falling back to github.repository_owner). Empty means
+# "don't assign" — useful for local dry-runs.
+ASSIGNEE="${ASSIGNEE:-}"
+assignee_args=()
+[ -n "$ASSIGNEE" ] && assignee_args=(--assignee "$ASSIGNEE")
+add_assignee_args=()
+[ -n "$ASSIGNEE" ] && add_assignee_args=(--add-assignee "$ASSIGNEE")
+
+# If a PR from this branch already exists, just push (already done above) and
+# refresh the body. Otherwise create a new one.
+if EXISTING_PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number'); [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+  gh pr edit "$EXISTING_PR" \
+    --body "$PR_BODY" --title "$PR_TITLE" \
+    --add-label security "${add_assignee_args[@]}"
+  echo "Updated existing PR #$EXISTING_PR"
+else
+  gh pr create \
+    --base "$BASE_BRANCH" \
+    --head "$BRANCH" \
+    --title "$PR_TITLE" \
+    --body "$PR_BODY" \
+    --label security "${assignee_args[@]}"
+fi

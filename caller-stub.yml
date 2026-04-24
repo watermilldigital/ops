@@ -1,0 +1,25 @@
+# Replace the contents of bmillerz/irelandtips/.github/workflows/vulnerability-check.yml
+# with THIS file after watermilldigital/ops is pushed and tagged v1.
+
+name: Weekly vulnerability check
+
+on:
+  schedule: [{ cron: '0 8 * * 1' }]    # Mon 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      refresh_scan:
+        description: "Force Cloudways to re-poll Patchstack before reading"
+        type: boolean
+        default: false
+
+concurrency:
+  group: vulnerability-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: watermilldigital/ops/.github/workflows/wp-vulnerability-check.yml@v1
+    secrets: inherit
+    with:
+      base_path: ${{ vars.BASE_PATH }}
+      refresh_scan: ${{ inputs.refresh_scan || false }}
