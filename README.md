@@ -66,17 +66,16 @@ reusable workflow starts and applies its `environment:` scope. Env-scoped
 vars are invisible at that point. Put BASE_PATH at **Settings → Secrets
 and variables → Actions → Variables** (repo-level).
 
-**Environment** (default `production`):
+**Environment scoping:**
 
-The reusable workflow declares `environment: ${{ inputs.environment }}`
-(default `production`). The environment must exist in the caller repo
-even if it's empty — GitHub rejects workflows that reference a non-existent
-environment. Create it once at **Settings → Environments → New environment**.
+The reusable workflow does NOT declare an `environment:`. All secrets
+must live at **repo level** (not environment-scoped) in the caller.
+The caller's `secrets: inherit` passes those through.
 
-This environment scope applies to SECRETS (via `secrets: inherit`), so
-env-scoped `SSH_PRIVATE_KEY` or `CLOUDWAYS_*` will flow through correctly
-when the caller's environment name matches the `environment` input. For a
-different environment name, pass it as `environment: <name>`.
+If your site has env-scoped secrets (e.g. from a separate `deploy.yml`
+pattern), either (a) duplicate them at repo level for this workflow, or
+(b) fork this workflow and hardcode an `environment:` block for your
+environment name.
 
 **Workflow permissions** — caller repo **must** allow write-mode default token:
 
@@ -94,7 +93,6 @@ to create and approve pull requests" must also be ticked.
 | `assignee` | `${{ github.repository_owner }}` | Someone other than the repo owner should own PRs + tracking issues |
 | `php_version` | `8.3` | Project runs on a different PHP |
 | `base_branch` | `main` | PR targets a branch other than `main` (e.g. `develop`) |
-| `environment` | `production` | Different environment name |
 | `refresh_scan` | `false` | On manual triggers, force Cloudways to re-poll Patchstack first |
 
 ## Versioning
