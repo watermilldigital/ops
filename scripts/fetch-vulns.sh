@@ -106,9 +106,12 @@ if ! response_ok "$RAW"; then
   exit 1
 fi
 
-# 3b. Surface scan freshness so stale data is visible in the run log.
+# 3b. Surface scan freshness so stale data is visible in the run log AND
+#     available to downstream steps (track-skipped-issue.sh puts it in the
+#     issue body so reviewers know how old the data is).
 LAST_FETCHED=$(echo "$RAW" | jq -r '.data.last_fetched_date // "unknown"')
 echo "Cloudways last_fetched_date: $LAST_FETCHED" >&2
+[ -n "${GITHUB_ENV:-}" ] && echo "LAST_FETCHED=$LAST_FETCHED" >> "$GITHUB_ENV"
 
 # 4. Normalise to the flat schema. The Cloudways response groups components
 #    under .data.{plugins|themes|wordpress}. Each component has:
